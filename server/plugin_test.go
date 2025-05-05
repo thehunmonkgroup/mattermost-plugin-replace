@@ -3,6 +3,7 @@ package main
 import (
 	"io/ioutil"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mattermost/mattermost-server/model"
@@ -26,7 +27,8 @@ type testCase struct {
 	command         string
 	rootId          string
 	expectedMessage string
-	shouldFail      bool
+	isInvalidFormat bool
+	shouldDismiss   bool
 }
 
 type testAPIConfig struct {
@@ -36,31 +38,24 @@ type testAPIConfig struct {
 	Channel *model.Channel
 }
 
-func setupAPI(api *plugintest.API, config *testAPIConfig) {
-
+func setupAPI(api *plugintest.API) {
 	api.On("GetServerVersion").Return(minServerVersion)
-
-	api.On("GetUser", mock.Anything).Return(config.User, nil)
-
-	api.On("GetChannel", mock.Anything).Return(config.Channel, nil)
-
-	api.On("SearchPostsInTeam", mock.Anything, mock.Anything).Return(config.Posts, nil)
-
-	api.On("SendEphemeralPost", mock.Anything, mock.Anything).Return(nil)
-
-	api.On("UpdatePost", mock.Anything).Return(config.Post, nil)
-
 }
 
 // TestExecuteCommand mocks the API calls (by using the private method setupAPI) and validates the inputs given
 func TestExecuteCommand(t *testing.T) {
-
 	cases := []testCase{
-		{"message to bee replaced", "s/bee/be", "", `message to be replaced`, false},
-		{"message to bee replaced", "s/bee/be", "123", `message to be replaced`, false},
-		{"what if I typ the word typical", "s/typ/type", "", `what if I type the word typical`, true},
-		{"baaad input", "s/bad", "", usage, true},
-		{"more baaad input", "s/baaad/", "", usage, true},
+		{"message to bee replaced", "s/bee/be", "", `message to be replaced`, false, true},
+		{"message to bee replaced", "s/bee/be", "123", `message to be replaced`, false, true},
+		{"message to bee replaced", " s/bee/be ", "", `message to be replaced`, false, true},
+		{"baaad input", "s/bad", "", "", true, true},
+		{"more baaad input", "s/baaad/", "", "", true, true},
+		{"empty input", "s/", "", "", true, true},
+		{"empty input", "s//", "", "", true, true},
+		{"not a command", "hello world", "", "", false, false},
+		{"contains s/ but not prefix", "this is not s/a/command", "", "", false, false},
+		{"starts with s but not s/", "say s/hello/world", "", "", false, false},
+		{"what if I typ the word typical", "s/typ/type", "", `what if I type the word typical`, false, true},
 	}
 
 	for _, tc := range cases {
@@ -78,35 +73,60 @@ func TestExecuteCommand(t *testing.T) {
 			defer api.AssertExpectations(t)
 
 			config := &testAPIConfig{
-				User:    &model.User{},
-				Posts:   []*model.Post{&model.Post{}},
+				User:    &model.User{Id: post.UserId, Username: "test"},
+				Posts:   []*model.Post{&model.Post{UserId: post.UserId, Message: tc.message}},
 				Post:    &model.Post{},
-				Channel: &model.Channel{},
+				Channel: &model.Channel{TeamId: "testTeamId"},
 			}
 
-			//needs to test input before setting API expectations
-			if _, err := splitAndValidateInput(tc.command); err != nil && tc.shouldFail {
-				assert.NotNil(t, err)
-				return
-			}
-
-			setupAPI(api, config)
+			setupAPI(api)
 
 			p := setupTestPlugin(t, api)
 
-			p.OnActivate()
-
-			returnedPost, err := p.MessageWillBePosted(c, post)
-			assert.Nil(t, returnedPost)
-			assert.Equal(t, err, "plugin.message_will_be_posted.dismiss_post")
-		})
-		t.Run(tc.command+" - Replace", func(t *testing.T) {
-			oldAndNew, err := splitAndValidateInput(tc.command)
-			if err != nil && tc.shouldFail {
-				assert.NotNil(t, err)
-				return
+			if !tc.isInvalidFormat && tc.shouldDismiss {
+				api.On("GetUser", post.UserId).Return(config.User, nil)
+				api.On("GetChannel", post.ChannelId).Return(config.Channel, nil)
+				if tc.rootId == "" {
+					api.On("SearchPostsInTeam", mock.AnythingOfType("string"), mock.AnythingOfType("[]*model.SearchParams")).Return(config.Posts, nil)
+				} else {
+					api.On("SearchPostsInTeam", mock.AnythingOfType("string"), mock.AnythingOfType("[]*model.SearchParams")).Return(config.Posts, nil)
+				}
+				api.On("UpdatePost", mock.AnythingOfType("*model.Post")).Return(config.Post, nil)
+				api.On("SendEphemeralPost", post.UserId, mock.AnythingOfType("*model.Post")).Return(nil)
+			} else if tc.isInvalidFormat && tc.shouldDismiss {
+				api.On("SendEphemeralPost", post.UserId, mock.AnythingOfType("*model.Post")).Return(nil)
 			}
-			assert.Equal(t, tc.expectedMessage, replace(tc.message, oldAndNew[0], oldAndNew[1]))
+
+			err := p.OnActivate()
+			assert.Nil(t, err)
+
+			returnedPost, returnedErr := p.MessageWillBePosted(c, post)
+
+			assert.Nil(t, returnedPost)
+
+			if tc.shouldDismiss {
+				assert.Equal(t, "plugin.message_will_be_posted.dismiss_post", returnedErr)
+			} else {
+				assert.Equal(t, "", returnedErr)
+			}
+
+			api.AssertExpectations(t)
+		})
+
+		t.Run(tc.command+" - Replace", func(t *testing.T) {
+			trimmedCmd := strings.TrimSpace(tc.command)
+			oldAndNew, err := splitAndValidateInput(trimmedCmd)
+
+			if tc.isInvalidFormat {
+				assert.NotNil(t, err)
+			} else if strings.HasPrefix(trimmedCmd, "s/") {
+				assert.Nil(t, err)
+				assert.NotNil(t, oldAndNew)
+				assert.Len(t, oldAndNew, 2)
+				if tc.expectedMessage != "" {
+					assert.Equal(t, tc.expectedMessage, replace(tc.message, oldAndNew[0], oldAndNew[1]))
+				}
+			}
 		})
 	}
 }

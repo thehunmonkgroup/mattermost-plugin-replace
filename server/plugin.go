@@ -58,7 +58,7 @@ func (p *Plugin) checkServerVersion() error {
 	return nil
 }
 
-//OnActivate registers the /s command with the API
+// OnActivate registers the /s command with the API
 func (p *Plugin) OnActivate() error {
 	return p.checkServerVersion()
 }
@@ -129,15 +129,24 @@ func replace(str, old, new string) string {
 
 // MessageWillBePosted parses every post. If our s/ command is present, it replaces the last post.
 func (p *Plugin) MessageWillBePosted(c *plugin.Context, post *model.Post) (*model.Post, string) {
+	trimmedMessage := strings.TrimSpace(post.Message)
+
+	//Explicitly check if the message starts with "s/" after trimming whitespace.
+	if !strings.HasPrefix(trimmedMessage, "s/") {
+		return nil, ""
+	}
 
 	//notification that will be sent as an ephemeral post
 	notification := &model.Post{ChannelId: post.ChannelId, CreateAt: model.GetMillis(), RootId: post.RootId}
 	//Validate input
-	oldAndNew, err := splitAndValidateInput(post.Message)
+	oldAndNew, err := splitAndValidateInput(trimmedMessage)
 
-	//if no valid input, just publish post normally
+	//Handle cases where the format is invalid *after* "s/" (e.g., "s/foo", "s//bar")
 	if err != nil {
-		return nil, ""
+		errMsg := fmt.Sprintf("Invalid command format. %s", usage)
+		notification.Message = errMsg
+		p.API.SendEphemeralPost(post.UserId, notification)
+		return nil, "plugin.message_will_be_posted.dismiss_post"
 	}
 
 	old := oldAndNew[0]
@@ -146,14 +155,12 @@ func (p *Plugin) MessageWillBePosted(c *plugin.Context, post *model.Post) (*mode
 
 	//Get user data
 	user, appErr := p.API.GetUser(post.UserId)
-
 	if appErr != nil {
 		return nil, ""
 	}
 
 	//Find channel to get access to teamId
 	ch, appErr := p.API.GetChannel(post.ChannelId)
-
 	if appErr != nil {
 		return nil, ""
 	}
@@ -163,13 +170,12 @@ func (p *Plugin) MessageWillBePosted(c *plugin.Context, post *model.Post) (*mode
 	if errId != "" {
 		notification.Message = errId
 		p.API.SendEphemeralPost(user.Id, notification)
-		return nil, ""
+		return nil, "plugin.message_will_be_posted.dismiss_post"
 	}
 
 	lastPost.Message = replace(lastPost.Message, old, new)
 
 	_, appErr = p.API.UpdatePost(lastPost)
-
 	if appErr != nil {
 		return nil, ""
 	}
